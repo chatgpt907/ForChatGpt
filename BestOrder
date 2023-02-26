@@ -1,0 +1,851 @@
+package ru.jbonds.alorbonds.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import ru.jbonds.alorbonds.model.Order;
+import ru.jbonds.alorbonds.model.OrderBook;
+import ru.jbonds.alorbonds.model.OrderTable;
+import ru.jbonds.alorbonds.repository.OrderTableRepository;
+import ru.jbonds.alorbonds.repository.StrategyActiveRepository;
+import ru.jbonds.alorbonds.request.ClientOrderRq;
+import ru.jbonds.alorbonds.request.OrderBookRq;
+import ru.jbonds.alorbonds.request.OrderDeleteRq;
+import ru.jbonds.alorbonds.request.OrdersLimitPostRq;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Objects;
+
+//Сделать лучшую заявку на покупку/продажу из стакана с записью информации о заявке в бд
+//TODO переписать completableFuture с обработкой результата
+//TODO Добавить обнаружение робота
+@Service
+public class BestOrder {
+
+    private static final Logger log = LoggerFactory.getLogger(BestOrder.class);
+
+    @Autowired
+    private OrderBookRq orderBookRq;
+
+    @Autowired
+    private OrdersLimitPostRq ordersLimitPostRq;
+
+    @Autowired
+    private ClientOrderRq clientOrderRq;
+
+    @Autowired
+    private OrderDeleteRq orderDeleteRq;
+
+    @Autowired
+    private OrderTableRepository orderTableRepository;
+
+    @Autowired
+    private StrategyActiveRepository strategyActiveRepository;
+
+    //Контракт:
+    //Метод должен позволять выставить заявку по лучшей цене в стакане либо максимально заданной цене
+    // при этом должен учитывать другие свои заявки по данному инструменту(не перебивать их, соблюдать очередность)
+    //Метод должен принимать только id стратегии из таблицы стратегий
+
+    @Async
+    public void makeOrder(long idStrategy) {
+
+        //получить данные по id из таблицы
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+
+        //проверить покупаем или продаем
+        switch (strAct.getSide()) {
+            case ("buy") ->
+                    buyBestOrderToEnd(strAct.getIdMoex(), strAct.getQuantity(), strAct.getStrategy(), strAct.getPriceBuy(), strAct.getIdStrategy());
+            case ("sell") ->
+                    sellBestOrderToEnd(strAct.getIdMoex(), strAct.getQuantity(), strAct.getStrategy(), strAct.getPriceSell(), strAct.getIdStrategy());
+            default ->
+                //неверный статус
+                    log.error("Неверный статус Side {}", strAct.getSide());
+
+        }
+
+    }
+
+    //тут выставляем по лучшей цене либо по лимиту(внутри лимита тоже по лучшей)
+    //метод выставить заявку и отслеживать выполнение по лучшей цене
+    //проверять по таблице заявок цены
+    public Long newBestOrder(Long idStrategy) throws JsonProcessingException {
+
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+        String idMoex = strAct.getIdMoex();
+        int quantity = strAct.getQuantity();
+        String strategyName = strAct.getStrategy();
+        var side = strAct.getSide();
+
+        BigDecimal priceLimit = strAct.getSide().equals("buy") ? strAct.getPriceBuy() : strAct.getPriceSell();
+
+        BigDecimal priceCurrent = priceLimit;
+        log.info("Старт покупка buyBestOrderToEnd");
+        log.info("ID MOEX: ,{}, количество: {}, Стратегия: {}, Лимит цены: {}, ID стратегии: {}", idMoex, quantity, strategyName, priceLimit, idStrategy);
+
+        //мы хотим встать по цене N + 0.01 - проверяем кто стоит по этой цене если наш то встаем по такой же
+        // получили стакан в виде List цен
+        var orderBookArray = getOrderBookArray(idMoex, strAct.getSide());
+        if (!orderBookArray.isEmpty()) {
+
+            for (var priceOrder : orderBookArray) {
+                //если наш лимит больше цены в стакане
+                if (priceLimit.compareTo(priceOrder) >= 0) {
+                    log.info("наша цена ");
+                    log.info("Сверяем не наша ли это заявка в OrderTable");
+                    var lTable = orderTableRepository.findByIdMoexAndStatusAndSide(strAct.getIdMoex(), "working", "buy");
+
+                    //Проверяем не пустая ли таблица заявок
+                    if (lTable.isEmpty()) {
+                        priceCurrent = priceOrder.add(new BigDecimal("0.01"));
+                    } else {
+                        //проверяем цены наших заявок
+                        for (OrderTable ordertable : lTable) {
+                            if (ordertable.getPrice().compareTo(priceOrder) == 0) {
+                                //сверяем кто выше по актив стратегии
+                                //var strList = strategyActiveRepository.findByIdMoexAndSideAndStatusIsNotLike(idMoex, side, "fi");
+                                priceCurrent = priceOrder;
+                            } else {
+                                priceCurrent = priceOrder.add(new BigDecimal("0.01"));
+                            }
+                        }
+
+                    }
+
+                    break;
+                    //если наш лимит меньше максимальной цены в стакане
+                } else {
+                    //найти где встать внутри стакана
+                    //найти id элемента после которого встаем 100.5, 100.8 наш лимит - 100.6
+                    // найти первый элемент который больше лимита и прибавить к нему 0.01
+
+                    for (int i = orderBookArray.size() - 1; i <= 0; i--) {
+
+                        if (orderBookArray.get(i).compareTo(priceLimit) >= 0) {
+
+                            priceCurrent = orderBookArray.get(i - 1).add(new BigDecimal("0.01"));
+
+                        }
+                    }
+                }
+            }
+
+        } else {
+            //если у нас пустой стакан выставляем по лимит минус 10
+            priceCurrent = priceLimit.subtract(new BigDecimal("10.0"));
+        }
+
+        //все что делает этот метод - вычисляет priceCurrent - возможно вычислять отдельно - выставлять заявку отдельно?
+        return ordersLimitPostRq.submitOrderLimitWithResponse(idMoex, priceCurrent, side, quantity, strategyName, idStrategy);
+    }
+
+    //метод для получения целевой цены покупки/продажи
+    public BigDecimal getPriceCurrent(Long idStrategy){
+
+        //получили данные по стратегии
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+        String idMoex = strAct.getIdMoex();
+        int quantity = strAct.getQuantity();
+        String strategyName = strAct.getStrategy();
+
+        BigDecimal priceLimit = strAct.getSide().equals("buy") ? strAct.getPriceBuy() : strAct.getPriceSell();
+
+        BigDecimal priceCurrent = priceLimit;
+        log.info("Старт проверка");
+        log.info("ID MOEX: ,{}, количество: {}, Стратегия: {}, Лимит цены: {}, ID стратегии: {}", idMoex, quantity, strategyName, priceLimit, idStrategy);
+
+        //мы хотим встать по цене N + 0.01 - проверяем кто стоит по этой цене если наш то встаем по такой же
+        // получили стакан в виде List цен
+        var orderBookArray = getOrderBookArray(idMoex, strAct.getSide());
+        if (!orderBookArray.isEmpty()) {
+
+            for (var priceOrder : orderBookArray) {
+                //если наш лимит больше цены в стакане
+                if (priceLimit.compareTo(priceOrder) >= 0) {
+                    log.info("наша цена ");
+                    log.info("Сверяем не наша ли это заявка в OrderTable");
+                    var lTable = orderTableRepository.findByIdMoexAndStatusAndSide(strAct.getIdMoex(), "working", "buy");
+
+                    //Проверяем не пустая ли таблица заявок
+                    if (lTable.isEmpty()) {
+                        priceCurrent = priceOrder.add(new BigDecimal("0.01"));
+                    } else {
+                        //проверяем цены наших заявок
+                        for (OrderTable ordertable : lTable) {
+                            if (ordertable.getPrice().compareTo(priceOrder) == 0) {
+                                //сверяем кто выше по актив стратегии
+                                //var strList = strategyActiveRepository.findByIdMoexAndSideAndStatusIsNotLike(idMoex, side, "fi");
+                                priceCurrent = priceOrder;
+                            } else {
+                                priceCurrent = priceOrder.add(new BigDecimal("0.01"));
+                            }
+                        }
+
+                    }
+
+                    break;
+                    //если наш лимит меньше максимальной цены в стакане
+                } else {
+                    //найти где встать внутри стакана
+                    //найти id элемента после которого встаем 100.5, 100.8 наш лимит - 100.6
+                    //найти первый элемент который больше лимита и прибавить к нему 0.01
+
+                    for (int i = orderBookArray.size() - 1; i <= 0; i--) {
+
+                        if (orderBookArray.get(i).compareTo(priceLimit) >= 0) {
+
+                            priceCurrent = orderBookArray.get(i - 1).add(new BigDecimal("0.01"));
+
+                        }
+                    }
+                }
+            }
+
+        } else {
+            //если у нас пустой стакан выставляем по лимит минус 10
+            priceCurrent = priceLimit.subtract(new BigDecimal("10.0"));
+        }
+
+        return priceCurrent;
+
+    }
+
+    //задача создать метод возможно универсальный
+    //Метод должен позволять выставить заявку по лучшей цене в стакане либо максимально заданной цене
+    // при этом должен учитывать другие свои заявки по данному инструменту(не перебивать их, соблюдать очередность)
+    //
+    @Async
+    public void orderToEnd(Long idStrategy) {
+
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+        String idMoex = strAct.getIdMoex();
+
+        Long idOrder = 0L;
+        var success = 0;
+
+        //подобрать условие до какого момента выполняется заявка? strAct.getStatus().equals("working"
+        while (success == 0) {
+
+            try {
+
+                idOrder = newBestOrder(idStrategy);
+
+                if (idOrder != 0) {
+
+                    //проверить выполнилась ли заявка
+                    var order = clientOrderRq.getOrderWithBd(idOrder);
+                    log.info("Заявка: {}", order.getId());
+
+                    //working, filled, canceled, rejected
+                    switch (order.getStatus()) {
+                        case ("working") -> {
+                            //идем дальше по циклу
+                            log.info("Заявка в работе");
+
+                            //Проверить лучшая ли наша заявка.
+                            //Получить лучшую цену
+                            //нужен метод сравнения выставленной цены заявки со стаканом перебил кто-то или нет
+
+                            while ((!checkOrder(idStrategy, idOrder)) & (order.getStatus().equals("working"))) {
+
+                                log.info("Ждем 5000");
+                                Thread.sleep(5000);
+                                order = clientOrderRq.getOrderWithBd(idOrder);
+
+                            }
+
+                            success = checkOrderFillOrCancel(idOrder, success);
+
+                        }
+                        case ("filled") -> {
+                            //успех - выход
+                            log.info("Case filled - Заявка выполнена по цене {}", order.price);
+                            success = checkOrderFillOrCancel(idOrder, success);
+
+                        }
+                        case ("canceled") ->
+                            //неудача - выход
+                                log.error("Заявка отменена");
+                        case ("rejected") ->
+                            //неудача - выход
+                                log.error("Заявка отклонена");
+                        default ->
+                            //неверный статус - выход
+                                log.error("Неверный статус заявки");
+                    }
+
+                } else {
+                    log.error("Заявка не выставлена");
+                    //проверяем счет и возможно ждем появления средств?
+                    break;
+                }
+
+            } catch (Exception e) {
+
+                e.printStackTrace();
+                log.error(e.getMessage());
+                log.error(idMoex);
+                log.error(String.valueOf(idOrder));
+                break;
+
+            }
+
+        }
+
+    }
+
+    //нужен метод сравнения выставленной цены заявки со стаканом перебил кто-то или нет
+    public boolean checkOrder(Long idStrategy, Long idOrder) {
+
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+        //var lTable = orderTableRepository.findByIdMoexAndStatusAndSide(strAct.getIdMoex(), "working", "buy");
+        var order = clientOrderRq.getOrderWithBd(idOrder);
+        var orderBookArray = getOrderBookArray(strAct.getIdMoex(), strAct.getSide());
+        boolean updateRequired = false;
+
+        var currentPrice = BigDecimal.valueOf(order.getPrice());
+
+        BigDecimal priceLimit = strAct.getSide().equals("buy") ? strAct.getPriceBuy() : strAct.getPriceSell();
+
+        //проверяем что массив не пустой
+        if (!orderBookArray.isEmpty()) {
+            var indexArr = orderBookArray.indexOf(currentPrice);
+            //проверяем на возможный выход из массива
+            if (indexArr == -1){
+                return true;
+            }
+            log.info("Текущий индекс {}", indexArr);
+            if (orderBookArray.size() == indexArr + 1 || indexArr == 0 ){
+                log.info("Ты лучший!");
+            }else {
+
+                log.info(" currentPrice , {}", currentPrice);
+                log.info(" indexArr -1  , {}", orderBookArray.get(indexArr - 1));
+                log.info(" indexArr +1 , {}", orderBookArray.get(indexArr + 1));
+                if (currentPrice.add(new BigDecimal("0.01")).compareTo(priceLimit) >= 0) {
+                    log.info("Цена достигла максимума - проверяем можно ли встать ниже");
+                    //проверяем можно ли встать ниже
+
+                    if (
+                            (orderBookArray.get(indexArr + 1).add(new BigDecimal("0.01")).compareTo(currentPrice)) >= 0 &&
+                                    ((orderBookArray.get(indexArr - 1)).compareTo(currentPrice) >= 0) &&
+                                    ((orderBookArray.get(indexArr - 1)).compareTo(priceLimit) <= 0)
+                    ) {
+                        updateRequired = true;
+                    }
+
+                } else {
+
+                    log.info("Все значения:");
+                    log.info(orderBookArray.toString());
+                    log.info(" currentPrice , {}", currentPrice);
+                    log.info(" indexArr -1  , {}", orderBookArray.get(indexArr - 1));
+                    log.info(" indexArr +1 , {}", orderBookArray.get(indexArr + 1));
+                    log.info(" priceMax , {}", priceLimit);
+                    log.info(String.valueOf(orderBookArray.get(indexArr + 1).add(new BigDecimal("0.01"))));
+                    //b1 - проверяем, что у нас лучшая заявка после предыдущей
+                    var b1 = orderBookArray.get(indexArr + 1).add(new BigDecimal("0.01")).compareTo(currentPrice) >= 0;
+                    //b2 - проверяем, что сверху нас нет лучших заявок
+                    var b2 = (orderBookArray.get(indexArr - 1)).compareTo(currentPrice) >= 0;
+                    //b3 - проверяем, что мы не достигли максимума
+                    var b3 = orderBookArray.get(indexArr - 1).add(new BigDecimal("0.01")).compareTo(priceLimit) <= 0;
+                    log.info(String.valueOf(b1));
+                    log.info(String.valueOf(b2));
+                    log.info(String.valueOf(b3));
+
+                    if (b1) {
+                        log.info("наша цена лучшая внизу");
+                        if (b2 & b3) {
+                            log.info("сверху нас есть лучше заявки и они ниже максимума");
+                            updateRequired = true;
+
+                        } else {
+                            log.info("сверху нас нет лучше заявок либо они выше максимума");
+                        }
+                    } else {
+                        log.info("наша цена не лучшая внизу");
+                        updateRequired = true;
+                    }
+
+                }
+
+            }
+
+        }
+
+        return updateRequired;
+    }
+
+    //нужен метод который выставляет заявку по лучшей цене без разницы
+    @Async
+    public void buyBestOrderWithCheck(Long idStrategy) {
+
+        //проверяем orderTable по idMoex очередность
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+        var lTable = orderTableRepository.findByIdMoexAndStatusAndSide(strAct.getIdMoex(), "working", "buy");
+
+        //проверяемые кейсы: Ты один единственный в стакане, две заявки,
+        if (lTable.isEmpty()) {
+
+            log.info("Заявок по такой облигации {} нет", strAct.getIdMoex());
+            //вызываем метод
+            //buyBestOrderToEndFromActiveStrategy(idStrategy);
+
+        } else {
+
+            //сравнить по цене - вывести номер - в отдельный метод
+            var numBook = numberOfOrderBook(idStrategy);
+            log.info("Заявка по облигации {} будет под N {}", strAct.getIdMoex(), numBook);
+
+        }
+
+    }
+
+    //метод для сравнения какой ты по счету в стакане среди своих заявок
+    //принимает на вход idStrategy
+    //на выходе номер
+    public int numberOfOrderBook(Long idStrategy) {
+
+        int number = 0;
+        var strAct = strategyActiveRepository.findByIdStrategy(idStrategy);
+        var lStrAct = strategyActiveRepository.findByIdMoexAndSideAndStatusIsNotLike(strAct.getIdMoex(), strAct.getSide(), "fi");
+
+        if (lStrAct.size() >= 1) {
+
+            for (var strategyActive : lStrAct) {
+
+                //сравнить с ценой получить на каком ты месте
+                //проверить покупаем или продаем
+
+                if (strAct.getSide().equals("buy") &&
+                        strategyActive.getPriceBuy().compareTo(strAct.getPriceBuy()) <= 0) {
+
+                    log.info("Проверяем цену 1 {},  2 {}", strategyActive.getPriceBuy(), strAct.getPriceBuy());
+
+                    number++;
+
+                } else if (strAct.getSide().equals("sell") &&
+                        strategyActive.getPriceSell().compareTo(strAct.getPriceSell()) <= 0) {
+
+                    log.info("Проверяем цену 1 {},  2 {}", strategyActive.getPriceSell(), strAct.getPriceSell());
+
+                    number++;
+                }
+
+            }
+
+        }
+
+        return number;
+
+    }
+
+    //Получить лучшую цену покупки и продажи по idMoex
+    public BigDecimal[] getGlass0(String idMoex) {
+
+        var orderBook = orderBookRq.getOrderBookRq(idMoex);
+
+        var bids = orderBook.getBids();
+        var asks = orderBook.getAsks();
+
+        var bid0 = bids.get(0);
+        var ask0 = asks.get(0);
+
+        var bidPrice = bid0.getPrice();
+        var askPrice = ask0.getPrice();
+
+        return new BigDecimal[]{bidPrice, askPrice};
+    }
+
+    public OrderBook getOrderBook(String idMoex) {
+
+        log.info("Смотрим стаканы Idmoex {}", idMoex);
+
+        var orderBook = orderBookRq.getOrderBookRq(idMoex);
+
+        log.info(orderBook.toString());
+
+        var bids = orderBook.getBids();
+        var asks = orderBook.getAsks();
+
+        log.info("кол-во Биды : {}", bids.size());
+        log.info("кол-во Аски : {}", asks.size());
+
+        var bid0 = bids.get(0);
+        var ask0 = asks.get(0);
+
+        log.info("Бид 0 : {}", bid0.toString());
+        log.info("Аск 0 : {}", ask0.toString());
+
+        var bid1 = bids.get(1);
+        var ask1 = asks.get(1);
+
+        log.info("Бид 1 : {}", bid1);
+        log.info("Аск 1 : {}", ask1);
+
+        var bidPrice = bid0.getPrice();
+        var askPrice = ask0.getPrice();
+
+        log.info("Цена 0 : {}", bidPrice.toString());
+        log.info("Цена 0 : {}", askPrice.toString());
+
+        return orderBook;
+    }
+
+    //возвращает массив bigdecimal
+    public ArrayList<BigDecimal> getOrderBookArray(String idMoex, String side) {
+
+        ArrayList<BigDecimal> orderBookArray = new ArrayList<>();
+
+        log.info("Смотрим стаканы Idmoex {}", idMoex);
+
+        var orderBook = orderBookRq.getOrderBookRq(idMoex);
+
+        log.info(orderBook.toString());
+
+        if (side.equals("buy")) {
+
+            var bids = orderBook.getBids();
+            log.info("кол-во Биды : {}", bids.size());
+            log.info("Биды до: {}", bids);
+            for (var bid : bids) {
+
+                orderBookArray.add(bid.getPrice());
+
+            }
+            log.info("Биды после: {}", orderBookArray);
+
+
+        } else {
+
+            var asks = orderBook.getAsks();
+            log.info("кол-во Аски : {}", asks.size());
+            log.info("Аски до: {}", asks);
+            for (var ask : asks) {
+
+                orderBookArray.add(ask.getPrice());
+
+            }
+            log.info("Аски после: {}", orderBookArray);
+
+
+        }
+
+        return orderBookArray;
+
+    }
+
+    //метод для получения цены покупки/продажи
+    public BigDecimal getPriceOrder(String idMoex, String side, int targetOrderBook) {
+
+        BigDecimal price = null;
+        //Получить стакан
+        var orderBook = getOrderBook(idMoex);
+
+        if (side.equals("buy")) {
+
+            //получаем в виде bigdecimal лучшую цену из стакана на покупку при заданной цели - № в стакане
+            var priceOrderBook = orderBook.getBids().get(targetOrderBook).getPrice();
+            //прибавляем 0.01 - в целом не очень правильно лучше прибавлять возможную дельту
+            price = priceOrderBook.add(new BigDecimal("0.01"));
+
+        } else if (side.equals("sell")) {
+
+            //получаем в виде bigdecimal лучшую цену из стакана на продажу при заданной цели - № в стакане
+            var priceOrderBook = orderBook.getAsks().get(targetOrderBook).getPrice();
+            //отнимаем 0.01 - в целом не очень правильно лучше прибавлять возможную дельту
+            price = priceOrderBook.subtract(new BigDecimal("0.01"));
+
+        } else {
+            log.error("Не правильно указана сторона buy/sell");
+        }
+
+        return price;
+
+    }
+
+    //Выставить заявку на покупку по лучшей цене в стакане +0,01
+    //TODO заявки по лимиту никак не отслеживаются на выполнение и не попадают в таблицы strategyActive
+    public Long buyBestOrder(String idMoex, int quantity, String strategyName, Long idStrategy) throws JsonProcessingException {
+
+        int targetOrderBook = 0;
+
+        var buyPrice = getPriceOrder(idMoex, "buy", targetOrderBook);
+
+        //Сделать заявку по лучшей цене + 0.01
+        var order = ordersLimitPostRq.submitOrderLimitWithResponse(idMoex, buyPrice, "buy", quantity, strategyName, idStrategy);
+        log.info(String.valueOf(order));
+
+        return order;
+    }
+
+    //Выставить заявку на продажу по лучшей цене в стакане +0,01
+    //TODO заявки по лимиту никак не отслеживаются на выполнение и не попадают в таблицы strategyActive
+    public Long sellBestOrder(String idMoex, int quantity, String strategyName, Long idStrategy) throws JsonProcessingException {
+
+        //Получить лучшую цену
+        int targetOrderBook = 0;
+
+        var sellPrice = getPriceOrder(idMoex, "sell", targetOrderBook);
+
+        //Сделать заявку по лучшей цене - 0.01
+        var order = ordersLimitPostRq.submitOrderLimitWithResponse(idMoex, sellPrice, "sell", quantity, strategyName, idStrategy);
+        log.info(String.valueOf(order));
+
+        return order;
+    }
+
+    // метод для циклического выставления заявки на покупку по лучшей цене до ее выполнения или достижения уровня
+    @Async
+    public void buyBestOrderToEnd(String idMoex, int quantity, String strategyName, BigDecimal limitPrice, Long idStrategy) {
+
+        Long idOrder = 0L;
+        int success = 0;
+
+        while (success < quantity) {
+
+            log.info("Старт покупка buyBestOrderToEnd");
+            log.info("ID MOEX: ,{}, количество: {}, Стратегия: {}, Лимит цены: {}, ID стратегии: {}", idMoex, quantity, strategyName, limitPrice, idStrategy);
+
+            try {
+
+                //проверить стакан сравнить с лимитом - выставить по стакану или лимиту
+                var priceGlass = getGlass0(idMoex);
+                var priceGlassBuy = priceGlass[0];
+
+                if (limitPrice.compareTo(priceGlassBuy) > 0) {
+                    //выставить заявку в стакан
+                    log.info("выставить заявку в стакан");
+                    idOrder = buyBestOrder(idMoex, quantity, strategyName, idStrategy);
+                } else {
+                    //выставить заявку по конкретной цене
+                    log.info("выставить заявку по лимиту: {}", limitPrice);
+                    idOrder = ordersLimitPostRq.submitOrderLimitWithResponse(idMoex, limitPrice, "buy", quantity, strategyName, idStrategy);
+                    break;
+                }
+
+                if (idOrder != 0) {
+
+                    //проверить выполнилась ли заявка
+                    var order = clientOrderRq.getOrderWithBd(idOrder);
+                    log.info("Заявка: {}", order.getId());
+
+                    //working, filled, canceled, rejected
+                    switch (order.getStatus()) {
+                        case ("working") -> {
+                            //идем дальше по циклу
+                            log.info("Заявка в работе");
+
+                            //Проверить лучшая ли наша заявка.
+                            //Получить лучшую цену
+                            priceGlass = getGlass0(idMoex);
+                            priceGlassBuy = priceGlass[0];
+                            log.info(String.valueOf(priceGlassBuy));
+                            var price = order.getPrice();
+                            log.info(String.valueOf(price));
+
+                            while ((priceGlassBuy.compareTo(BigDecimal.valueOf(order.price)) == 0) & (order.getStatus().equals("working"))) {
+
+                                log.debug("Ждем 3000");
+                                Thread.sleep(3000);
+                                priceGlass = getGlass0(idMoex);
+                                priceGlassBuy = priceGlass[0];
+                                order = clientOrderRq.getOrderWithBd(idOrder);
+
+                            }
+
+                            success = checkOrderFillOrCancel(idOrder, success);
+
+                        }
+                        case ("filled") -> {
+                            //успех - выход
+                            log.info("Case filled - Заявка выполнена по цене {}", order.price);
+                            success = checkOrderFillOrCancel(idOrder, success);
+
+                        }
+                        case ("canceled") -> //неудача - выход
+                                log.error("Заявка отменена");
+                        case ("rejected") ->
+                            //неудача - выход
+                                log.error("Заявка отклонена");
+                        default ->
+                            //неверный статус - выход
+                                log.error("Неверный статус заявки");
+                    }
+
+                } else {
+                    log.error("Заявка не выставлена");
+                    //проверяем счет и возможно ждем появления средств?
+                    break;
+                }
+
+            } catch (Exception e) {
+
+                e.printStackTrace();
+                log.error(e.getMessage());
+                log.error(idMoex);
+                log.error(String.valueOf(idOrder));
+                break;
+
+            }
+
+        }
+
+    }
+
+    // метод для циклического выставления заявки на продажу по лучшей цене до ее выполнения или достижения уровня
+    @Async
+    public void sellBestOrderToEnd(String idMoex, int quantity, String strategyName, BigDecimal limitPrice, Long idStrategy) {
+
+        Long idOrder = 0L;
+        int success = 0;
+
+        while (success < quantity) {
+
+            log.info("Старт продажа sellBestOrderToEnd");
+            log.info("ID MOEX: ,{}, количество: {}, Стратегия: {}, Лимит цены: {}, ID стратегии: {}", idMoex, quantity, strategyName, limitPrice, idStrategy);
+
+            try {
+
+                //проверить стакан сравнить с лимитом - выставить по стакану или лимиту
+                var priceGlass = getGlass0(idMoex);
+                var priceGlassSell = priceGlass[1];
+
+                if ((limitPrice.compareTo(priceGlassSell) < 0)) {
+                    //выставить заявку в стакан
+                    log.info("выставить заявку в стакан");
+                    idOrder = sellBestOrder(idMoex, quantity, strategyName, idStrategy);
+                } else {
+                    //выставить заявку по конкретной цене
+                    log.info("выставить заявку по лимиту: {}", limitPrice);
+                    idOrder = ordersLimitPostRq.submitOrderLimitWithResponse(idMoex, limitPrice, "sell", quantity, strategyName, idStrategy);
+                    break;
+                }
+
+                if (idOrder != 0) {
+
+                    //проверить выполнилась ли заявка
+                    var order = clientOrderRq.getOrderWithBd(idOrder);
+                    log.info("Заявка: {}", order.getId());
+
+                    //working, filled, canceled, rejected
+                    switch (order.getStatus()) {
+                        case ("working") -> {
+                            //идем дальше по циклу
+                            log.info("Заявка в работе");
+
+                            //Проверить лучшая ли наша заявка.
+                            //Получить лучшую цену
+                            priceGlass = getGlass0(idMoex);
+                            priceGlassSell = priceGlass[1];
+                            log.info(String.valueOf(priceGlassSell));
+                            var price = order.getPrice();
+                            log.info(String.valueOf(price));
+
+                            while ((priceGlassSell.compareTo(BigDecimal.valueOf(order.price)) == 0) & (order.getStatus().equals("working"))) {
+
+                                log.debug("Ждем 3000");
+                                Thread.sleep(3000);
+                                priceGlass = getGlass0(idMoex);
+                                priceGlassSell = priceGlass[1];
+                                order = clientOrderRq.getOrderWithBd(idOrder);
+
+                            }
+
+                            success = checkOrderFillOrCancel(idOrder, success);
+
+                        }
+                        case ("filled") -> {
+                            //успех - выход
+
+                            log.info("Case filled - Заявка выполнена по цене {}", order.price);
+                            success = checkOrderFillOrCancel(idOrder, success);
+
+                        }
+                        case ("canceled") ->
+                            //неудача - выход
+                                log.error("Заявка отменена");
+                        case ("rejected") ->
+                            //неудача - выход
+                                log.error("Заявка отклонена");
+                        default ->
+                            //неверный статус - выход
+                                log.error("Неверный статус заявки");
+                    }
+
+                } else {
+                    log.error("Заявка не выставлена");
+                    //проверяем счет и возможно ждем появления средств?
+                    break;
+                }
+
+            } catch (Exception e) {
+
+                e.printStackTrace();
+                log.error(e.getMessage());
+                log.error(idMoex);
+                log.error(String.valueOf(idOrder));
+                break;
+
+            }
+
+        }
+
+    }
+
+    //вспомогательный метод для проверки выполнилась ли заявка
+    public int checkOrderFillOrCancel(Long idOrder, int success) throws InterruptedException, JsonProcessingException {
+
+        Order order = clientOrderRq.getOrderWithBd(idOrder);
+        log.info("Ждем 1000");
+        Thread.sleep(1000);
+
+        // добавить проверку на лимит цены в цикле
+        if (order.getStatus().equals("filled")) {
+
+            log.info("Заявка выполнена по цене {}", order.price);
+            updateStrategyActive(order, idOrder);
+            success++;
+
+        } else {
+            //отменяем заявку и идем на выход
+            log.info("Отменяем заявку и идем на выход");
+            orderDeleteRq.submitOrderDeleteWithBd(idOrder);
+            log.info("Идем на выход");
+        }
+
+        return success;
+
+    }
+
+
+    //Обновляем записи в order и active по результатам выполнения/отмены заявок
+    public void updateStrategyActive(Order order, Long idOrder) {
+
+        var orderTable = orderTableRepository.findById(idOrder).orElseThrow();
+        var strategyActive = strategyActiveRepository.findByIdStrategy(orderTable.getIdStrategy());
+        strategyActive.setStatus(orderTable.getStatus());
+
+        if (Objects.equals(order.getSide(), "buy")) {
+
+            strategyActive.setPriceBuyFact(BigDecimal.valueOf(order.getPrice()));
+            strategyActive.setSide("sell");
+            strategyActive.setStatus("active");
+
+        } else {
+
+            strategyActive.setPriceSellFact(BigDecimal.valueOf(order.getPrice()));
+            strategyActive.setStatus("finish");
+
+        }
+
+        strategyActiveRepository.save(strategyActive);
+
+    }
+
+}
